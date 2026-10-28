@@ -140,10 +140,8 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD", "!d2mEgFw")
 MT5_SERVER   = os.getenv("MT5_SERVER",   "HantecMarketsMU-MT5")
 
 SYMBOLS: List[str] = [
-    "BTCUSD", "ETHUSD", "XAUUSD", "CHFJPY",
-    "EURCAD", "EURCHF", "EURGBP", "EURJPY",
-    "EURUSD", "GBPUSD", "USDCAD", "USDCHF",
-    "USDJPY", "USOIL+",
+    "XRPUSD", "ETHUSD", "SOLUSD", "LTCUSD", "BNBUSD",
+    "ADAUSD", "BCHUSD", "XTZUSD", "UNIUSD", "AVAXUSD",
 ]
 
 ORACLE_PARAMS = dict(
