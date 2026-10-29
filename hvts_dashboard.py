@@ -2,8 +2,33 @@
 # -*- coding: utf-8 -*-
 """
 ════════════════════════════════════════════════════════════════════════════════
-HVTS SmartMoney AI — Futuristic Rich Terminal Dashboard  (v1.1 — LICENSED)
+HVTS SmartMoney AI — Futuristic Rich Terminal Dashboard  (v1.3 — LICENSED + SMC H4/D1)
 ════════════════════════════════════════════════════════════════════════════════
+
+WHAT CHANGED SINCE v1.2
+───────────────────────
+    • NEW SIGNAL — "SMC D1": same persistent binary SMC bias as SMC H4, on the
+      Daily timeframe. New table column + second line in the FOCUS panel.
+      The SMC engine now runs per timeframe (SMC_TIMEFRAMES) with independent
+      stored states, so H4 and D1 can disagree.
+
+WHAT CHANGED SINCE v1.1
+───────────────────────
+    • NEW SIGNAL — "SMC H4": a persistent, strictly binary Smart-Money-Concept
+      bias (▲ BULLISH / ▼ BEARISH — never neutral) per symbol, computed on the
+      H4 timeframe by basic_smc.analyze_basic_smc().
+        - Shown as a new column in the SYMBOL SIGNALS table and as an extra
+          line (confidence / method / swing levels) in the FOCUS panel.
+        - Persistent: the last state is stored in SQLite (basic_smc table) and
+          survives restarts. It only flips on a new H4 break of structure.
+        - If basic_smc returns neutral (cold start, no breakout, trend and
+          structure disagree) the dashboard seeds a bias from the position of
+          price inside the recent swing range (premium = bullish, discount =
+          bearish) and stores it, so the column is never neutral.
+        - Own database file (hvts_dashboard_smc.db next to the script/exe,
+          override with HVTS_SMC_DB) so the dashboard never overwrites the
+          state used by the trading bots. Demo mode uses a separate *_demo.db.
+    • Fixed: --demo crashed on symbols missing from BASE_PRICES (KeyError).
 
 WHAT CHANGED SINCE v1.0
 ───────────────────────
@@ -63,7 +88,7 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Deque, Dict, List, Optional
+from typing import Any, Deque, Dict, List, Optional
 
 import numpy as np
 import pandas as pd
@@ -111,6 +136,40 @@ except Exception as exc:
     _MT5_IMPORT_ERR = str(exc)
 
 # ---------------------------------------------------------------------------
+# SMC (Smart Money Concept) — H4 binary bias
+#   basic_smc keeps a persistent bullish/bearish state per (symbol, timeframe)
+#   in SQLite.  The dashboard uses its OWN db file so it never overwrites the
+#   state of the trading bots.  basic_smc reads its db path at import time and
+#   creates the table immediately, so DB_PATH is pointed at our file for the
+#   duration of the import (then restored), and SMC_STATE_DB is set explicitly.
+# ---------------------------------------------------------------------------
+def _app_dir() -> Path:
+    """Folder of the .exe when frozen by PyInstaller, else of this script."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+SMC_DB_LIVE = Path(os.getenv("HVTS_SMC_DB", str(_app_dir() / "hvts_dashboard_smc.db")))
+SMC_DB_DEMO = SMC_DB_LIVE.with_name(f"{SMC_DB_LIVE.stem}_demo{SMC_DB_LIVE.suffix}")
+
+_prev_db_path = os.environ.get("DB_PATH")
+os.environ["DB_PATH"] = str(SMC_DB_LIVE)
+try:
+    import basic_smc as _smc
+    SMC_AVAILABLE = True
+    _SMC_IMPORT_ERR: Optional[str] = None
+except Exception as exc:
+    _smc = None                             # type: ignore[assignment]
+    SMC_AVAILABLE = False
+    _SMC_IMPORT_ERR = str(exc)
+finally:
+    if _prev_db_path is None:
+        os.environ.pop("DB_PATH", None)
+    else:
+        os.environ["DB_PATH"] = _prev_db_path
+
+# ---------------------------------------------------------------------------
 # Licence imports — REQUIRED
 # ---------------------------------------------------------------------------
 try:
@@ -140,8 +199,8 @@ MT5_PASSWORD = os.getenv("MT5_PASSWORD", "!d2mEgFw")
 MT5_SERVER   = os.getenv("MT5_SERVER",   "HantecMarketsMU-MT5")
 
 SYMBOLS: List[str] = [
-    "XRPUSD", "ETHUSD", "SOLUSD", "LTCUSD", "BNBUSD",
-    "ADAUSD", "BCHUSD", "XTZUSD", "UNIUSD", "AVAXUSD",
+    "EURUSD", "GBPUSD", "USDCAD", "USDJPY", "USDCHF", "BTCUSD",
+    "ETHUSD", "BNBUSD", "XRPUSD", "SOLUSD", "US30", 
 ]
 
 ORACLE_PARAMS = dict(
@@ -163,6 +222,14 @@ ACCOUNT_INTERVAL   = 10.0
 M1_FETCH_COUNT     = 240
 HTF_FETCH          = {"M30": 240, "H1": 240, "H12": 120}
 MAX_RECENT_SIGNALS = 30
+
+# SMC H4 bias (basic_smc) — values mirror basic_smc's own H4 defaults
+SMC_TIMEFRAMES     = ["H4", "D1"]
+SMC_BARS           = {"H4": 150, "D1": 100}   # bars fetched per timeframe
+SMC_TF_LABEL      = "/".join(SMC_TIMEFRAMES)  # e.g. "H4/D1" (used in log lines)
+SMC_LOOKBACK       = 10       # rolling breakout window
+SMC_SWING_LOOKBACK = 3        # swing-point fallback window
+SMC_FETCH_INTERVAL = 60.0     # H4/D1 structure moves slowly — no need to poll every 15 s
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -219,10 +286,23 @@ class SymbolState:
 
 
 @dataclass
+class SmcState:
+    """Persistent binary SMC bias for one symbol (never neutral once resolved)."""
+    state:       str                = ""      # "bullish" | "bearish" | "" (not yet resolved)
+    confidence:  float              = 0.0
+    strength:    float              = 0.0
+    method:      str                = ""      # breakout | swing | bootstrap | stored | forced
+    swing_high:  Optional[float]    = None
+    swing_low:   Optional[float]    = None
+    updated:     Optional[datetime] = None
+
+
+@dataclass
 class DashboardState:
     account:        AccountState  = field(default_factory=AccountState)
     license:        LicenseState  = field(default_factory=LicenseState)
     symbols:        Dict[str, SymbolState] = field(default_factory=dict)
+    smc:            Dict[str, Dict[str, SmcState]] = field(default_factory=dict)  # tf -> symbol -> state
     focus_symbol:   str = "BTCUSD"
     recent_signals: Deque[Dict] = field(default_factory=lambda: deque(maxlen=MAX_RECENT_SIGNALS))
     start_time:     datetime = field(default_factory=datetime.now)
@@ -283,6 +363,21 @@ def signal_cell(sig_type: Optional[SignalType]) -> Text:
     }
     txt, style = m.get(sig_type, ("?", "white"))
     return Text(txt, style=style)
+
+
+def get_smc(dash: DashboardState, tf: str, sym: str) -> Optional[SmcState]:
+    return dash.smc.get(tf, {}).get(sym)
+
+
+def smc_cell(smc: Optional[SmcState]) -> Text:
+    """Binary SMC cell: ▲ BULLISH / ▼ BEARISH (no neutral state exists)."""
+    if not SMC_AVAILABLE:
+        return Text("n/a", style="grey50")
+    if smc is None or smc.state not in ("bullish", "bearish"):
+        return Text("·  …", style="grey50")
+    if smc.state == "bullish":
+        return Text("▲ BULLISH", style="bold bright_green")
+    return Text("▼ BEARISH", style="bold bright_red")
 
 
 def net_text(v: float) -> Text:
@@ -696,6 +791,28 @@ def gen_demo_m1(symbol: str, bars: int = 3000) -> pd.DataFrame:
     )
 
 
+_DEMO_TF = {"H4": ("4h", 0.006), "D1": ("1D", 0.014)}   # pandas freq, per-bar volatility
+
+
+def gen_demo_bars(symbol: str, tf: str) -> pd.DataFrame:
+    """Synthetic history for an SMC timeframe; last close equals the symbol's demo base price."""
+    freq, vol = _DEMO_TF[tf]
+    bars = SMC_BARS[tf]
+    rng = np.random.default_rng((abs(hash(symbol)) + len(tf) + ord(tf[0])) % (2**32))
+    base = BASE_PRICES.get(symbol, 100.0)
+    close = np.exp(np.cumsum(rng.normal(0.0, vol, bars)))
+    close = close * (base / close[-1])
+    open_ = np.roll(close, 1); open_[0] = close[0]
+    high  = np.maximum(open_, close) * (1 + np.abs(rng.normal(0, vol / 3, bars)))
+    low   = np.minimum(open_, close) * (1 - np.abs(rng.normal(0, vol / 3, bars)))
+    idx   = pd.date_range(end=pd.Timestamp.now().floor(freq), periods=bars, freq=freq)
+    return pd.DataFrame(
+        {"open": open_, "high": high, "low": low, "close": close,
+         "volume": rng.integers(500, 20000, bars)},
+        index=idx,
+    )
+
+
 def resample_htf(df_m1: pd.DataFrame, rule: str) -> pd.DataFrame:
     return (
         df_m1.resample(rule)
@@ -756,6 +873,8 @@ def render_signals_panel(dash: DashboardState) -> Panel:
     )
     tbl.add_column("SYMBOL", style="bold bright_white", no_wrap=True)
     tbl.add_column("SIGNAL", justify="center", no_wrap=True)
+    for _tf in SMC_TIMEFRAMES:
+        tbl.add_column(f"SMC {_tf}", justify="center", no_wrap=True)
     tbl.add_column("CONF", justify="right", no_wrap=True)
     tbl.add_column("NET", justify="right", no_wrap=True)
     tbl.add_column("STR", justify="right", no_wrap=True)
@@ -769,6 +888,7 @@ def render_signals_panel(dash: DashboardState) -> Panel:
             tbl.add_row(
                 Text(sym, style="bold bright_white"),
                 Text("· LOADING", style="grey50"),
+                *[smc_cell(get_smc(dash, tf, sym)) for tf in SMC_TIMEFRAMES],
                 Text("—"), Text("—"), Text("—"), Text("—"), Text("—"), Text(""),
             )
             continue
@@ -776,6 +896,7 @@ def render_signals_panel(dash: DashboardState) -> Panel:
             tbl.add_row(
                 Text(sym, style="bold bright_white"),
                 Text("⚠ ERROR", style="bold bright_red"),
+                *[smc_cell(get_smc(dash, tf, sym)) for tf in SMC_TIMEFRAMES],
                 Text("—"), Text("—"), Text("—"), Text("—"), Text("—"),
                 Text(st.error[:40], style="italic red"),
             )
@@ -789,6 +910,7 @@ def render_signals_panel(dash: DashboardState) -> Panel:
         tbl.add_row(
             Text(sym, style="bold bright_white"),
             signal_cell(st.derived_type),
+            *[smc_cell(get_smc(dash, tf, sym)) for tf in SMC_TIMEFRAMES],
             conf,
             net_text(st.net_score),
             Text(f"{st.strength:.2f}",
@@ -893,6 +1015,24 @@ def render_detail_panel(dash: DashboardState) -> Panel:
     info.append("\nTrend ", style="grey58")
     info.append_text(sparkline(st.net_history, width=40))
 
+    smc_lines = []
+    for tf in SMC_TIMEFRAMES:
+        smc = get_smc(dash, tf, sym)
+        line = Text()
+        line.append(f"SMC {tf} ", style="grey58")
+        line.append_text(smc_cell(smc))
+        if smc is not None and smc.state in ("bullish", "bearish"):
+            line.append("   Conf ", style="grey58")
+            line.append(f"{smc.confidence:.0f}%", style="bold bright_white")
+            line.append("   Method ", style="grey58")
+            line.append(smc.method or "—", style="bright_white")
+            if smc.swing_high is not None and smc.swing_low is not None:
+                line.append("   Swing H ", style="grey58")
+                line.append(fmt_price(smc.swing_high), style="bright_white")
+                line.append(" / L ", style="grey58")
+                line.append(fmt_price(smc.swing_low), style="bright_white")
+        smc_lines.append(line)
+
     body = Group(
         Text.from_markup(
             f"[bold bright_cyan]FOCUS[/] · [bold bright_white]{sym}[/]"
@@ -900,6 +1040,7 @@ def render_detail_panel(dash: DashboardState) -> Panel:
         ),
         cols,
         info,
+        *smc_lines,
     )
     return Panel(body, border_style="bright_cyan", box=ROUNDED, padding=(0, 1))
 
@@ -965,6 +1106,156 @@ def build_dashboard(dash: DashboardState) -> Layout:
     root["detail"].update(render_detail_panel(dash))
     root["log"].update(render_log_panel(dash))
     return root
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SMC H4 ENGINE  (binary, persistent)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def smc_select_db(path: Path) -> None:
+    """Point basic_smc at the given state database (live vs demo) and init it."""
+    if not SMC_AVAILABLE:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _smc.SMC_STATE_DB = str(path)
+        _smc._init_db()
+    except Exception:
+        pass
+
+
+def _forced_binary_bias(df: pd.DataFrame) -> Optional[Dict[str, Any]]:
+    """
+    Last-resort bias used only when basic_smc returns neutral (no stored state,
+    no breakout, and its trend/structure bootstrap disagreed).
+
+    Premium / discount read of the recent swing range:
+        price above the range midpoint → bullish
+        price below the range midpoint → bearish
+        exactly on the midpoint        → sign of the regression slope
+    """
+    try:
+        high  = df["high"].to_numpy(dtype=float)
+        low   = df["low"].to_numpy(dtype=float)
+        close = df["close"].to_numpy(dtype=float)
+        n = len(close)
+        if n < 5:
+            return None
+
+        swing_highs, swing_lows = _smc.detect_swing_points(high, low, SMC_SWING_LOOKBACK)
+        win = min(SMC_LOOKBACK, n - 1)
+        hi = swing_highs[-1] if swing_highs else float(np.max(high[-win - 1:-1]))
+        lo = swing_lows[-1]  if swing_lows  else float(np.min(low[-win - 1:-1]))
+
+        mid = (hi + lo) / 2.0
+        px  = float(close[-1])
+        if px > mid:
+            sig = "bullish"
+        elif px < mid:
+            sig = "bearish"
+        else:
+            slope = float(np.polyfit(np.arange(n), close, 1)[0])
+            sig = "bullish" if slope >= 0 else "bearish"
+        return {"signal": sig, "swing_high": float(hi), "swing_low": float(lo)}
+    except Exception:
+        return None
+
+
+def compute_smc(sym: str, df: Optional[pd.DataFrame], tf: str) -> Optional[Dict[str, Any]]:
+    """
+    Binary SMC bias for `sym` on timeframe `tf` ("H4" or "D1").
+
+    Returns a basic_smc-style dict whose 'signal' is ALWAYS 'bullish' or
+    'bearish', or None when there is neither usable data nor a stored state
+    (the UI then shows a pending marker instead of a made-up direction).
+
+    basic_smc does the heavy lifting and persists the state:
+        breakout → swing → stored state → trend/structure bootstrap
+    Only if all of those yield neutral do we seed a bias ourselves and persist
+    it, so subsequent cycles read it back as the 'stored' state.
+    """
+    if not SMC_AVAILABLE:
+        return None
+
+    res = _smc.analyze_basic_smc(
+        df if df is not None else pd.DataFrame(),
+        lookback=SMC_LOOKBACK,
+        swing_lookback=SMC_SWING_LOOKBACK,
+        symbol=sym,
+        timeframe=tf,
+    )
+    if res.get("signal") in ("bullish", "bearish"):
+        return res
+
+    forced = _forced_binary_bias(df) if df is not None and not df.empty else None
+    if forced is None:
+        return None
+
+    _smc._set_stored_state(
+        symbol=sym,
+        state=forced["signal"],
+        confidence=50.0,
+        strength=0.0,
+        swing_high=forced["swing_high"],
+        swing_low=forced["swing_low"],
+        method_used="forced",
+        lookback_used=SMC_LOOKBACK,
+        timeframe=tf,
+    )
+    res.update({
+        "signal":      forced["signal"],
+        "swing_high":  forced["swing_high"],
+        "swing_low":   forced["swing_low"],
+        "confidence":  50.0,
+        "strength":    0.0,
+        "method_used": "forced",
+    })
+    return res
+
+
+def apply_smc_result(dash: DashboardState, sym: str, res: Optional[Dict[str, Any]], tf: str) -> None:
+    """Copy a compute_smc() result into the dashboard (keeps last state on None)."""
+    if not res or res.get("signal") not in ("bullish", "bearish"):
+        return
+    smc = dash.smc.setdefault(tf, {}).setdefault(sym, SmcState())
+    smc.state      = res["signal"]
+    smc.confidence = float(res.get("confidence") or 0.0)
+    smc.strength   = float(res.get("strength") or 0.0)
+    smc.method     = str(res.get("method_used") or "")
+    smc.swing_high = res.get("swing_high")
+    smc.swing_low  = res.get("swing_low")
+    smc.updated    = datetime.now()
+
+
+async def update_smc(conn: MT5Connection, dash: DashboardState) -> int:
+    """Fetch bars for every symbol/timeframe and refresh the persistent SMC biases."""
+    if not SMC_AVAILABLE:
+        return 0
+
+    async def _bars(sym: str, tf: str):
+        try:
+            return sym, tf, _normalize_ohlcv(await conn.get_ohlcv(sym, tf, SMC_BARS[tf]))
+        except Exception:
+            # No data this cycle → empty frame; basic_smc falls back to the stored state
+            return sym, tf, pd.DataFrame()
+
+    frames = await asyncio.gather(*[_bars(s, tf) for tf in SMC_TIMEFRAMES for s in SYMBOLS])
+
+    def _resolve_all():
+        out = []
+        for sym, tf, df in frames:
+            try:
+                out.append((sym, tf, compute_smc(sym, df, tf)))
+            except Exception:
+                out.append((sym, tf, None))
+        return out
+
+    resolved = 0
+    for sym, tf, res in await asyncio.to_thread(_resolve_all):
+        apply_smc_result(dash, sym, res, tf)
+        if res:
+            resolved += 1
+    return resolved
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1099,9 +1390,11 @@ class DemoDriver:
     def __init__(self):
         self.prices = dict(BASE_PRICES)
         self.rng = np.random.default_rng(42)
+        self.smc_bars: Dict[str, Dict[str, pd.DataFrame]] = {}   # tf -> symbol -> synthetic history
 
     def next_bar(self, sym: str, ts: pd.Timestamp) -> pd.Series:
-        p = self.prices[sym]
+        # setdefault: SYMBOLS may contain symbols that are not in BASE_PRICES
+        p = self.prices.setdefault(sym, BASE_PRICES.get(sym, 100.0))
         change = float(self.rng.normal(0, p * 0.0004))
         new_p = p + change
         high = max(p, new_p) * (1 + abs(float(self.rng.normal(0, 0.0002))))
@@ -1112,6 +1405,23 @@ class DemoDriver:
              "volume": int(self.rng.integers(100, 1000))},
             name=ts,
         )
+
+
+async def update_demo_smc(driver: DemoDriver, dash: DashboardState) -> None:
+    """Demo counterpart of update_smc(): live demo price drives the forming bar."""
+    if not SMC_AVAILABLE:
+        return
+    for tf, per_sym in driver.smc_bars.items():
+        for sym, hist in per_sym.items():
+            try:
+                df = hist.copy()
+                px = float(driver.prices.get(sym, df["close"].iloc[-1]))
+                df.iloc[-1, df.columns.get_loc("close")] = px
+                df.iloc[-1, df.columns.get_loc("high")]  = max(float(df["high"].iloc[-1]), px)
+                df.iloc[-1, df.columns.get_loc("low")]   = min(float(df["low"].iloc[-1]), px)
+                apply_smc_result(dash, sym, compute_smc(sym, df, tf), tf)
+            except Exception:
+                continue
 
 
 async def update_demo(
@@ -1155,6 +1465,8 @@ def bootstrap_demo(
         df_30m = resample_htf(df_m1, "30min")
         df_1h  = resample_htf(df_m1, "1h")
         df_12h = resample_htf(df_m1, "12h")
+        for _tf in SMC_TIMEFRAMES:
+            driver.smc_bars.setdefault(_tf, {})[sym] = gen_demo_bars(sym, _tf)
         try:
             oracles[sym].prime_from_htf(df_30m, df_1h, df_12h)
             st = SymbolState(sym)
@@ -1321,6 +1633,20 @@ async def run_dashboard(
         driver = bootstrap_demo(oracles, dash, console)
         dash.mt5_status = dash.mt5_status or "DEMO"
 
+    # ── 4b. SMC H4 bias (persistent binary state) ──────────────────────
+    if SMC_AVAILABLE:
+        if live_ok:
+            smc_select_db(SMC_DB_LIVE)
+            n_smc = await update_smc(conn, dash)
+            console.log(f"[bright_green]✅ SMC {SMC_TF_LABEL} bias resolved {n_smc}/{len(SYMBOLS) * len(SMC_TIMEFRAMES)}"
+                        f"  ({SMC_DB_LIVE.name})[/]")
+        else:
+            smc_select_db(SMC_DB_DEMO)
+            await update_demo_smc(driver, dash)
+            console.log(f"[yellow]⚠ SMC {SMC_TF_LABEL} running on DEMO data  ({SMC_DB_DEMO.name})[/]")
+    else:
+        console.log(f"[yellow]⚠ basic_smc unavailable — SMC {SMC_TF_LABEL} disabled: {_SMC_IMPORT_ERR}[/]")
+
     # ── 5. Initial snapshot ────────────────────────────────────────────
     for sym in SYMBOLS:
         if sym in dash.symbols and not dash.symbols[sym].error:
@@ -1330,6 +1656,7 @@ async def run_dashboard(
     # ── 6. Live loop ───────────────────────────────────────────────────
     last_fetch   = 0.0
     last_account = 0.0
+    last_smc     = time.time()          # initial SMC pass already done in step 4b
     try:
         with Live(
             build_dashboard(dash),
@@ -1351,6 +1678,13 @@ async def run_dashboard(
                             last_fetch = now
                     elif driver is not None:
                         await update_demo(driver, oracles, dash)
+
+                    if now - last_smc >= SMC_FETCH_INTERVAL:
+                        if live_ok:
+                            await update_smc(conn, dash)
+                        elif driver is not None:
+                            await update_demo_smc(driver, dash)
+                        last_smc = now
 
                     dash.cycle += 1
                     dash.focus_symbol = pick_focus(dash)
